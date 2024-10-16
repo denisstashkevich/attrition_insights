@@ -1,0 +1,736 @@
+---
+title: "denis_stashkevich_hr_attrition"
+author: "Denis Stashkevich"
+date: "2023-01-02"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r}
+rm(list = ls())
+suppressWarnings(suppressPackageStartupMessages(library(tidyverse)))  
+suppressWarnings(suppressPackageStartupMessages(library(data.table)))  
+suppressWarnings(suppressPackageStartupMessages(library(rcompanion)))  
+suppressWarnings(suppressPackageStartupMessages(library(effsize)))  
+suppressWarnings(suppressPackageStartupMessages(library(roperators)))  
+suppressWarnings(suppressPackageStartupMessages(library(future.apply)))  
+suppressWarnings(suppressPackageStartupMessages(library(dqrng)))  
+suppressWarnings(suppressPackageStartupMessages(library(tidymodels)))  
+suppressWarnings(suppressPackageStartupMessages(library(themis)))  
+suppressWarnings(suppressPackageStartupMessages(library(caret))) 
+suppressWarnings(suppressPackageStartupMessages(library(treemapify)))  
+suppressWarnings(suppressPackageStartupMessages(library(gridExtra))) 
+suppressWarnings(suppressPackageStartupMessages(library(pbapply))) 
+suppressWarnings(suppressPackageStartupMessages(library(FactoMineR))) 
+```
+
+```{r}
+IBM_HR_data_raw <- fread("WA_Fn-UseC_-HR-Employee-Attrition.csv")
+```
+
+We drop these columns since they do not contain any information
+
+```{r}
+IBM_HR_data_proc <-IBM_HR_data_raw %>% 
+    dplyr::select(-Over18, -EmployeeNumber, -EmployeeCount, -StandardHours)
+```
+
+To select relevant variables, we write a function that would iterate over columns and apply an appropriate statistical test
+
+1.  For categorical data we choose chi-squared test as a test and Cohen's w to measure effect size. Other choices may include G-test as a test and Goodman and Kruskal's lambda or Cramers'V to measure effect size
+
+2.  For numeric data we choose Wilcoxon rank sum test since we have only two groups. Vargha and Delaney's A would be used to measure effect size. There are many other options for measuring effect size, but VDA is very easy to interpret.
+
+3.  We correct p-values for the inflated probability of making type I error by using False Discovery Rate method. There are many other methods to do the correction but FDA is regarded as a sensible approach in general case.
+
+```{r}
+
+wilcox_test <- function(cat_vec, num_vec){
+  categories <- cat_vec %>% unique() 
+  stopifnot(length(categories) == 2)
+  
+  x <- num_vec[cat_vec == categories[1]]
+  y <- num_vec[cat_vec == categories[2]]
+  
+  return(wilcox.test(x,y)$p.value)
+}
+
+vda <- function(cat_vec, num_vec){
+  categories <- cat_vec %>% unique() 
+  stopifnot(length(categories) == 2)
+  
+  x <- num_vec[cat_vec == categories[1]]
+  y <- num_vec[cat_vec == categories[2]]
+  
+  return(effsize::VD.A(x,y)$estimate)
+}
+
+  
+explore_possible_effects <- function(data_df,
+                                     column_to_compare, 
+                                     other_cols, 
+                                     cat_test_fun = function(x,y) chisq.test(x,y)$p.value,
+                                     cat_effect_size = rcompanion::cohenW,
+                                     num_test_fun = wilcox_test,
+                                     num_effect_size = vda,   
+                                     p.adjust_method = "fdr",  #"holm" "hochberg" "hommel" "bonferroni" "BH" "BY" 
+                                     alpha = 0.001
+){
+  
+  inter_VDA   <- function(x){
+      case_when(
+        x %between% c(0.56, 0.64) || x %between% c(0.34, 0.44) ~ "Small effect",
+        x %between% c(0.64, 0.71) || x %between% c(0.29, 0.34) ~ "Medium effect",
+        x >0.71 || x < 0.29 ~ "Large effect",
+        TRUE ~ "No effect or negligible"
+      )
+    }
+    
+  inter_CohenW <- function(x){
+      case_when(
+        x < 0.1 ~ "No effect or negligible",
+        x %between% c(0.1, 0.3) ~ "Small effect",
+        x %between% c(0.3, 0.5) ~ "Medium effect",
+        x > 0.5 ~ "Large effect"
+      )
+    } 
+  
+  compare_two_cols <- function(name_col_a, name_col_b, col_a,col_b){
+    
+    stopifnot(class(col_a) %in% c("factor", "character"))
+    
+    if(class(col_a) == "factor"){
+      col_a = col_a %>% as.character()
+    }
+    
+    if(class(col_b) %in% c("numeric", "integer")){
+          
+        p_val = num_test_fun(col_a,col_b)
+        ef_size <- num_effect_size(col_a,col_b)
+          
+          return(data.frame(
+            "Col A" = name_col_a,
+            "Col B" = name_col_b,
+            "type" = "numeric",
+            "test" = "Wilcoxon rank sum test",
+            "effect size" = "Vargha and Delaney’s A",
+            "p-value" = p_val,
+            "effect size value" = ef_size,
+            "effect size interpretation" = inter_VDA(ef_size)
+          ))
+    }else{
+        col_b = col_b %>% as.character()
+      
+        p_val = cat_test_fun(col_a,col_b)
+        ef_size <- cat_effect_size(col_a,col_b)
+          
+          return(data.frame(
+            "Col A" = name_col_a,
+            "Col B" = name_col_b,
+            "type" = "categorical",
+            "test" = "Chi-Squared test",
+            "effect size" = "Cohen W",
+            "p-value" = p_val,
+            "effect size value" = ef_size,
+            "effect size interpretation" = inter_CohenW(ef_size)
+          ))      
+      
+    }
+  }
+  
+  ###########################
+  
+  res_list <- vector("list", length(other_cols))
+  iter <- 1
+  for(col_ in other_cols){
+    res_list[[iter]] <- compare_two_cols(name_col_a = column_to_compare, 
+                                         name_col_b = col_,
+                                         col_a = data_df[[column_to_compare]], 
+                                         col_b = data_df[[col_]])
+    iter %+=% 1
+  }
+  
+  res_dt <- rbindlist(res_list)
+  res_dt[["p-value_adj"]] <- p.adjust(res_dt[["p.value"]], method = p.adjust_method)
+  res_dt[["statistically significant with chosen alpha"]] <- ifelse(res_dt[["p-value_adj"]] > alpha, "No", "Yes")
+  
+  return(res_dt)
+  
+}
+
+```
+
+```{r}
+explore_possible_effects(data_df = IBM_HR_data_proc,
+                         column_to_compare = "Attrition",
+                         other_cols = setdiff(colnames(IBM_HR_data_proc), "Attrition"))
+```
+
+The tests helped us to identify potentially useful variables, namely:
+
+Categorical: BusinessTravel, JobRole, MaritalStatus, OverTime
+
+Numeric: Age, DistanceFromHome, EnvironmentSatisfaction,JobInvolvement, JobLevel, JobSatisfaction, MonthlyIncome, StockOptionLevel, TotalWorkingYears, YearsAtCompany, YearsInCurrentRole, YearsWithCurrManager
+
+We may investigate these variables and their relationship with Attrition more closely
+
+```{r}
+make_stacked_barplot <- function(data, x,y){
+data %>%
+  group_by(!! sym(x),  !! sym(y)) %>%
+  count() %>%
+  ggplot(aes_string(fill=x, y='n', x=y)) +
+  geom_bar(position="fill", stat="identity") + 
+  coord_flip()
+}
+```
+
+```{r}
+make_stacked_barplot(IBM_HR_data_proc, "Attrition", "BusinessTravel")
+```
+
+It is evident that there is a clear relationship between the frequency of travelling and Attrition: the more the worker travels, the more likely he/she is to face attrition faster
+
+```{r}
+make_stacked_barplot(IBM_HR_data_proc, "Attrition", "JobRole")
+```
+
+We can observe that different job roles differ in the likelihood of attrition with Sales Representatives being the most likely. However, it is difficult to formulate the exact pattern.
+
+```{r}
+make_stacked_barplot(IBM_HR_data_proc, "Attrition", "MaritalStatus")
+```
+
+One may conclude that single people are more likely to experience attrition. However, the possible explanation may be that married workers are more dependent on keeping the the job. It is hard to know the exact cause of the observed data.
+
+```{r}
+make_a_treemap <- function(data, x,y){
+data %>%
+  group_by(!! sym(x),  !! sym(y)) %>%
+  count() %>%
+  mutate(lab = paste(y,'=', !!sym(y), "-", n)) %>%
+  ggplot(aes_string(area = 'n', fill = x, label = "lab")) +
+  geom_treemap() + 
+  geom_treemap_text(fontface = "italic", colour = "white", place = "centre") 
+}
+
+make_a_treemap(IBM_HR_data_proc, "Attrition", "OverTime")
+```
+
+From the treemap above it is clear that from all people that experienced attrition - most of them worked overtime. It makes this variable a very good predictor of attrition.
+
+```{r}
+IBM_HR_data_proc %>%
+  ggplot(aes(x = Age, fill = Attrition)) + 
+  geom_boxplot() 
+```
+
+It can be seen that the people that experienced attrition tend to be younger.
+
+```{r}
+IBM_HR_data_proc %>%
+  ggplot(aes(x = DistanceFromHome, fill = Attrition)) + 
+  geom_histogram() + 
+  facet_wrap(~Attrition, scales = "free_y")
+```
+
+Looking at the histograms above one may observe that the further away a person is from home, the more likely she/he is to experience attrition. The obvious explanation is that people may dislike the lengthy commutes.
+
+```{r}
+make_stacked_barplot(IBM_HR_data_proc, "Attrition", "EnvironmentSatisfaction")
+```
+
+The barplot above suggests an interesting pattern - people that are clearly not satisfied with the environment are more likely to experience attrition. However, the relationship is not linear and for
+
+```{r}
+make_stacked_barplot(IBM_HR_data_proc, "Attrition", "JobLevel")
+```
+
+Graph suggests that the likelihood of attrition is dependent on the job level with the lowest in the hierarchy being the most likely to attire. However, the relationship is clearly not linear as can be seen from the proportions for different job levels.
+
+```{r}
+make_stacked_barplot(IBM_HR_data_proc, "Attrition", "JobSatisfaction")
+```
+
+The barplot above simply confirms the common sense - the more a person is satisfied with the job, the less likely he/she is to face attrition.
+
+```{r}
+IBM_HR_data_proc %>%
+  ggplot(aes(x = MonthlyIncome, fill = Attrition)) + 
+  geom_boxplot() 
+```
+
+It seems that money also plays an important role - there is a statistically significant difference between the monthly income of people that did experience attrition and ones that did not.
+
+```{r}
+make_stacked_barplot(IBM_HR_data_proc, "Attrition", "StockOptionLevel")
+```
+
+No clear pattern is evident from the graph above other than the fact the the proportions are clearly different.
+
+```{r}
+total_w_years <- IBM_HR_data_proc %>%
+  ggplot(aes(x = TotalWorkingYears, fill = Attrition)) + 
+  geom_histogram() + 
+  facet_wrap(~Attrition, scales = "free_y")
+
+total_years_company <- IBM_HR_data_proc %>%
+  ggplot(aes(x = YearsAtCompany, fill = Attrition)) + 
+  geom_histogram() + 
+  facet_wrap(~Attrition, scales = "free_y")
+
+total_year_curr_role <- IBM_HR_data_proc %>%
+  ggplot(aes(x = YearsInCurrentRole, fill = Attrition)) + 
+  geom_histogram() + 
+  facet_wrap(~Attrition, scales = "free_y")
+
+total_year_curr_manager <- IBM_HR_data_proc %>%
+  ggplot(aes(x = YearsWithCurrManager, fill = Attrition)) + 
+  geom_histogram() + 
+  facet_wrap(~Attrition, scales = "free_y")
+
+grid.arrange(total_w_years, total_years_company, total_year_curr_role, total_year_curr_manager, nrow = 2, ncol = 2)
+```
+
+All these four histograms show a pretty similar picture - attrition is mostly a problem of relatively new workers in the company.
+
+We also may try some alternative approaches to identifying important variables. One way to do it is through step-wise addition of predictors to model (logistic regression) using AIC to choose models. At this point we do not care about the accuracy of the models, so we do not check assumptions for these models
+
+```{r}
+model_null <- 		glm(Attrition ~ 1, data = IBM_HR_data_proc %>% mutate(Attrition = Attrition %>% as.factor()), family = 'binomial') 
+formula_for_scope <- 	glm(Attrition ~ ., data = IBM_HR_data_proc %>% mutate(Attrition = Attrition %>% as.factor()), family = 'binomial') %>% formula()
+
+model_pruned_step_forw   <- stats::step(
+	model_null, 
+	scope = formula_for_scope,
+  method = 'forward',
+	trace = 0)
+
+formula_pruned <- formula(model_pruned_step_forw)
+formula_pruned
+```
+
+However, variables may end up in the final formula due to chance. To mitigate this possibility, bootstrapping approach can be chosen. We make 1000 bootstrap samples and do the procedure for each one of them. The idea is that important variables will end up in all such samples or the majority and irrelevant variables will not.
+
+```{r}
+give_formula_boot <- function(initial_data, formula_for_scope){
+  
+  boot_sample <- initial_data[dqrng::dqsample.int(nrow(initial_data), nrow(initial_data), replace = T),]
+  model_n <- 		glm(Attrition ~ 1, data = boot_sample, family = 'binomial') 
+
+  model_pruned_step_forw   <- stats::step(
+    model_n, 
+    scope = formula_for_scope,
+    method = 'forward', 
+    trace = 0)
+  return(model_pruned_step_forw %>% formula() %>% as.character() %>% .[3])
+}
+
+#plan(multisession)
+#vector_of_formulas <- future_replicate(1000, give_formula_boot(IBM_HR_data_proc %>% mutate(Attrition = Attrition %>% as.factor()), formula_for_scope)) # very computationally demanding 
+
+vector_of_formulas <- readRDS("vector_of_formulas.rds")
+
+```
+
+```{r}
+counts_features <- lapply(vector_of_formulas, function(x) strsplit(x, '\\+')) %>% 
+	unlist() %>%
+	trimws() %>% 
+	table() %>% 
+	sort()
+
+counts_features %>% 
+  as.data.frame() %>% 
+  rename(variable = 1) %>% 
+  ggplot(aes(x = variable, y = Freq)) + 
+  geom_col() + 
+  coord_flip()
+```
+
+We see exactly what we expect - some variable end up in every or almost every bootstrap sample, while others only in the minority of them. A cutoff of 250 can be chosen. It is also clear that most of the variables concur with those identified by the statistical tests.
+
+```{r}
+valid_variables <- counts_features[counts_features > 250] %>% names()
+```
+
+```{r}
+setDF(IBM_HR_data_proc)
+IBM_HR_data_proc_selected <- IBM_HR_data_proc[, c(valid_variables, "Attrition")] %>% 
+  mutate_if(is.character, as.factor)
+```
+
+From here we will use tidymodels framework to specify, train and evaluate ML models. Initially we split the data to the training and testing datasets
+
+```{r}
+split <- rsample::initial_split(IBM_HR_data_proc_selected, prop = .7, strata = Attrition)
+train <- rsample::training(split)
+test <- rsample::testing(split)
+```
+
+Next, we choose the method of validation. repeated (2 times) 10-fold cross validation method was chosen as a method with extremely reliable results. After that we specify the recipe - sequence of preprocessing steps. Since xgboost does not work with categorical variables as is, we perform one-hot-encoding on them. We also standartize (transforming to the z-scores) the variables that span several orders of magnitude - step_normalize. It is clear that we are facing the problem of class imbalance in our data =\> the models are going to be skewed towards predicting the majority class. To combat this, several techniques are available. We chose downsampling and SMOTE methods.
+
+```{r}
+folds <- vfold_cv(train, repeats = 2)
+
+rec_xbg <- recipe(Attrition ~ . , data = train) %>%
+  step_dummy(OverTime, BusinessTravel, JobRole,MaritalStatus,EducationField, Gender, one_hot = TRUE) %>%
+  step_downsample(Attrition) %>% #step_smote was also tried
+  step_normalize(DistanceFromHome, DailyRate, Age) %>% 
+  prep()
+
+#juice(rec_1)
+```
+
+Next, we specify the hyperparameters that are going to be tuned and create the grid with 20 combinations and search for the most optimal one. The metric that is the most important in our case is specificity (NOT sensitivity because "No" is viewed as a positive class!). In other words, we are mostly interested in predicting "Yes" for Attrition. However, if this assumption of the author is not accurate, metrics "accuracy" and "sensitivity" are also present in the final tables.
+
+```{r}
+# xgb_spec <- boost_tree(
+# 		trees = 1000,
+# 		tree_depth = tune(),
+# 		min_n = tune(),
+# 		loss_reduction = tune(),
+# 		sample_size = tune(),
+# 		mtry = tune(),
+# 		learn_rate = tune()
+# 	) %>%
+# 	set_engine('xgboost')%>%
+# 	set_mode('classification')
+# 
+# xgb_grid <- grid_latin_hypercube(
+# 	tree_depth(),
+# 	min_n(),
+# 	loss_reduction(),
+# 	sample_size = sample_prop(),
+# 	finalize(mtry(),train),
+# 	learn_rate(),
+# 	size = 20
+# )
+# 
+# xgb_wf <- workflow() %>% add_recipe(rec_xbg) %>% add_model(xgb_spec)
+# 
+# grid_s <- tune_grid(
+# 	xgb_wf,
+# 	resamples = folds,
+# 	grid = xgb_grid,
+# 	control = control_grid(save_pred = F, verbose= T),
+# 	metrics = metric_set(accuracy, spec, sens)
+# )
+# 
+# collect_metrics(grid_s) %>% dplyr::filter(.metric == 'spec') %>% arrange(desc(mean))
+```
+
+```{r}
+downsampled_xgb <- readRDS("downsampled_xgb.rds")
+smote_xgb <- readRDS("smote_xgb.rds")
+downsampled_xgb %>% collect_metrics()
+```
+
+```{r}
+downsampled_xgb %>% collect_metrics() %>%
+  mutate(technique = "downsampling") %>%
+  bind_rows(smote_xgb %>% collect_metrics() %>% mutate(technique = "SMOTE")) %>% 
+  dplyr::filter(.metric == 'spec') %>% 
+  ggplot(aes(x = mean, fill = technique)) + 
+  geom_boxplot() + 
+  xlab("Specificity")
+```
+
+Using the boxplots, we compare the performance of two class balancing techniques. It is clear that downsampling is superior in our particular case. Next, we use the model with the best hyperparameters and evaluate it on the testing data
+
+```{r}
+classif_res <- readRDS("best_xgb_downsampled.rds")
+#classif_res <- readRDS("best_xgb_smote.rds")
+
+#best_params <- try(grid_s %>% tune::select_best(metric = 'spec'))
+		
+#classif_res <-
+#  			xgb_wf %>%
+#  			tune::finalize_workflow(best_params) %>%
+#  			parsnip::fit(data = train)
+
+conf_m <- confusionMatrix(predict(classif_res, new_data = test) %>% unlist(), test$Attrition)
+conf_m
+
+```
+
+Despite the model having lower accuracy than naive classifier (always classifies as No), the specificity is relatively high. Next, we try KNN classifier with downsampling technique.
+
+```{r}
+# rec_knn <- recipe(Attrition ~ . , data = train) %>%
+#   step_downsample(Attrition) %>%
+#   step_normalize(DistanceFromHome, DailyRate, Age) %>%
+#   prep()
+# 
+# knn_spec <- nearest_neighbor(
+# 	  neighbors = tune()
+# 	) %>%
+# 	set_engine('kknn')%>%
+# 	set_mode('classification')
+# 
+# knn_grid <- expand.grid(neighbors = 2:10)
+# 
+# knn_wf <- workflow() %>% add_recipe(rec_knn) %>% add_model(knn_spec)
+# 
+# grid_s <- tune_grid(
+# 	knn_wf,
+# 	resamples = folds,
+# 	grid = knn_grid,
+# 	control = control_grid(save_pred = F, verbose= T),
+# 	metrics = metric_set(accuracy, spec, sens)
+# )
+# 
+# collect_metrics(grid_s) %>% dplyr::filter(.metric == 'spec') %>% arrange(desc(mean))
+
+downsample_knn <- readRDS("downsample_knn.rds")
+downsample_knn %>% collect_metrics()
+```
+
+```{r}
+classif_res <- readRDS("best_knn_downsampled.rds")
+
+#best_params <- try(grid_s %>% tune::select_best(metric = 'spec'))
+		
+#classif_res <-
+#  			knn_wf %>%
+#  			tune::finalize_workflow(best_params) %>%
+#  			parsnip::fit(data = train)
+
+conf_m <- confusionMatrix(predict(classif_res, new_data = test) %>% unlist(), test$Attrition)
+conf_m
+```
+
+Out next model to try is logistic regression. We will not check the assumptions of the model, since we are not interested in using the explaining power of the model, but only the predicting power. Logistic model doesn't really have hyperparameters to tune, so we simply evaluate it on the training data using repeated-10-foldCV. Since this step is not computationally intensive like the previous ones, we keep it without commenting.
+
+```{r}
+
+rec_glm <- recipe(Attrition ~ . , data = train) %>%
+  step_downsample(Attrition) %>%
+  step_normalize(DistanceFromHome, DailyRate, Age) %>%
+  prep()
+
+glm_spec <- logistic_reg() %>%
+  set_engine("glm")
+
+glm_wf_forw <- workflow() %>%
+  add_model(glm_spec) %>%
+  add_recipe(rec_glm)
+
+glm_res <- fit_resamples(
+  glm_wf_forw,
+  folds,
+  metrics = metric_set(accuracy, sens, spec),
+  control = tune::control_resamples(verbose = F,
+                                    save_pred = F)
+)
+
+#glm_res %>% collect_metrics()
+
+downsample_glm <- readRDS("downsample_glm.rds")
+downsample_glm %>% collect_metrics()
+```
+
+```{r}
+glm_model <- glm_wf_forw %>% parsnip::fit(., data = train)
+
+predictions <- glm_model %>%  predict(test, type = "class")
+
+conf_m <- confusionMatrix(predictions %>% unlist(), test$Attrition)
+conf_m
+```
+
+It has observed by the author that the final result for the specificity varies quite significantly from split to split. It is because every single correct or incorrect classification represents about 1.3% of the total score. That is why it was decided to perform monte-carlo cross validation for the 3 models with the best hyperparameters.
+
+```{r}
+MC_cross_validation <- function(data_df, wf, best_params = NULL, B = 200){
+  
+     fit_and_test <- function(data_df, wf, best_params){
+      split <- rsample::initial_split(data_df, prop = .7, strata = Attrition)
+      train <- rsample::training(split)
+      test <- rsample::testing(split)
+      
+      if(is.null(best_params)){
+        model <- wf %>% parsnip::fit(., data = train)
+        predictions <- model %>%  predict(test, type = "class")
+        conf_m <- confusionMatrix(predictions %>% unlist(), test$Attrition)
+      }else{
+        model <-	wf %>%	tune::finalize_workflow(best_params) %>%	parsnip::fit(data = train)
+        conf_m <- confusionMatrix(predict(classif_res, new_data = test) %>% unlist(), test$Attrition)
+      }
+
+      return(conf_m$byClass["Specificity"])
+     }
+  
+  
+  MC_test_errors <-pbreplicate(B,fit_and_test(data_df, wf, best_params))
+  
+}
+```
+
+```{r}
+#  rec_glm <- recipe(Attrition ~ . , data = IBM_HR_data_proc_selected) %>%
+#    step_downsample(Attrition) %>% 
+#    step_normalize(DistanceFromHome, DailyRate, Age) %>% 
+#    prep()
+#  
+#  glm_spec <- logistic_reg() %>% 
+#    set_engine("glm") 
+#  
+#  glm_wf <- workflow() %>%
+#    add_model(glm_spec) %>%
+#    add_recipe(rec_glm) 
+# 
+# ###
+# rec_knn <- recipe(Attrition ~ . , data = IBM_HR_data_proc_selected) %>%
+#   step_downsample(Attrition) %>%
+#   step_normalize(DistanceFromHome, DailyRate, Age) %>%
+#   prep()
+# 
+# knn_spec <- nearest_neighbor(
+# 	  neighbors = tune()
+# 	) %>%
+# 	set_engine('kknn')%>%
+# 	set_mode('classification')
+# 
+# knn_wf <- workflow() %>% add_recipe(rec_knn) %>% add_model(knn_spec)
+# ###
+# 
+# rec_xbg <- recipe(Attrition ~ . , data = IBM_HR_data_proc_selected) %>%
+#   step_dummy(OverTime, BusinessTravel, JobRole,MaritalStatus,EducationField, Gender, one_hot = TRUE) %>%
+#   step_downsample(Attrition) %>% #step_smote was also tried
+#   step_normalize(DistanceFromHome, DailyRate, Age) %>% 
+#   prep()
+# 
+# xgb_spec <- boost_tree(
+# 		trees = 1000,
+# 		tree_depth = tune(),
+# 		min_n = tune(),
+# 		loss_reduction = tune(),
+# 		sample_size = tune(),
+# 		mtry = tune(),
+# 		learn_rate = tune()
+# 	) %>%
+# 	set_engine('xgboost')%>%
+# 	set_mode('classification')
+# 
+# xgb_wf <- workflow() %>% add_recipe(rec_xbg) %>% add_model(xgb_spec)
+# ### 
+# 
+# best_params_knn <- downsample_knn %>% tune::select_best(metric = 'spec')
+# best_params_xgb <- downsampled_xgb %>% tune::select_best(metric = 'spec')
+# 
+# knn_specs <- MC_cross_validation(IBM_HR_data_proc_selected, knn_wf, best_params_knn, B = 300)
+# glm_specs <- MC_cross_validation(IBM_HR_data_proc_selected, glm_wf, NULL, B = 300)
+# xgb_specs <- MC_cross_validation(IBM_HR_data_proc_selected, xgb_wf, best_params_xgb, B = 300)
+
+knn_specs <- readRDS("knn_specs.rds")
+glm_specs <- readRDS("glm_specs.rds")
+xgb_specs <- readRDS("xgb_specs.rds")
+
+```
+
+```{r}
+results_final <- data.frame("knn_specs" = knn_specs, "glm_specs" = glm_specs, "xgb_specs" = xgb_specs) %>%
+  gather(key = "method", value = "specs")
+```
+
+```{r}
+results_final %>%
+  ggplot(aes(fill = method, x = specs)) +  
+  geom_boxplot()
+```
+
+```{r}
+results_final %>% 
+  group_by(method) %>%
+  summarize(mean_spec = mean(specs),
+            sd_spec = sd(specs))
+```
+
+As an alternative approach, We could have performed dimensionality reduction using PCA. In order to do that, we need to manually perform one-hot-encoding and standartization
+
+```{r}
+data_for_pca <- fastDummies::dummy_cols(IBM_HR_data_proc %>% dplyr::select(-Attrition), remove_selected_columns = T)
+data_for_pca$DailyRate <- scale(data_for_pca$DailyRate, center = T, scale = T) 
+data_for_pca$Age <- scale(data_for_pca$Age, center = T, scale = T) 
+data_for_pca$DistanceFromHome <- scale(data_for_pca$DistanceFromHome, center = T, scale = T) 
+data_for_pca$MonthlyRate <- scale(data_for_pca$MonthlyRate, center = T, scale = T) 
+data_for_pca$MonthlyIncome <- scale(data_for_pca$MonthlyIncome, center = T, scale = T) 
+data_for_pca$HourlyRate <- scale(data_for_pca$HourlyRate, center = T, scale = T) 
+data_for_pca$PercentSalaryHike <- scale(data_for_pca$PercentSalaryHike, center = T, scale = T) 
+
+pca <- FactoMineR::PCA(data_for_pca, scale.unit = F, graph = F, ncp = 25)
+                       
+summary(pca)
+```
+
+We see that first 20 principal components explain more than 99% of the variation in the data. we will keep only them (insted of original 41) and train+evaluate GLM model.
+
+```{r}
+ 
+data_df <- cbind(pca$ind$coord) %>% as.data.frame() %>% mutate(Attrition = IBM_HR_data_proc$Attrition %>% as.factor())
+
+split <- rsample::initial_split(data_df, prop = .7, strata = Attrition)
+train <- rsample::training(split)
+test <- rsample::testing(split)
+
+folds <- vfold_cv(train, repeats = 2)
+
+rec_glm <- recipe(Attrition ~ . , data = train) %>%
+  step_downsample(Attrition) %>%
+  prep()
+
+glm_spec <- logistic_reg() %>%
+  set_engine("glm")
+
+glm_wf_forw <- workflow() %>%
+  add_model(glm_spec) %>%
+  add_recipe(rec_glm)
+
+glm_res <- fit_resamples(
+  glm_wf_forw,
+  folds,
+  metrics = metric_set(accuracy, sens, spec),
+  control = tune::control_resamples(verbose = F,
+                                    save_pred = F)
+)
+
+glm_res %>% collect_metrics()
+
+glm_model <- glm_wf_forw %>% parsnip::fit(., data = train)
+
+predictions <- glm_model %>%  predict(test, type = "class")
+
+conf_m <- confusionMatrix(predictions %>% unlist(), as.factor(test$Attrition))
+conf_m
+
+```
+
+```{r}
+#glm_specs_PCA <- MC_cross_validation(data_df, glm_wf_forw, NULL, B = 300)
+glm_specs_PCA <- readRDS("glm_specs_PCA.rds")
+```
+
+It is evident from the results on training and testing data that dimensionality reduction via PC didn't help to improve results but didn't make them worse either.
+
+```{r}
+data.frame("glm_specs_PCA" = glm_specs_PCA, "glm_specs" = glm_specs) %>%
+  gather(key = "method", value = "specs") %>%
+  ggplot(aes(fill = method, x = specs)) +  
+  geom_boxplot()
+```
+
+To conclude, the following steps were taken:
+
+1.  Most important variables were identified via statistical tests
+
+2.  Exploratory data analysis was performed
+
+3.  Important variables were confirmed via using step function and bootstapping
+
+4.  GLM, KNN and Xgboost classifiers were trained and evaluated.
+
+5.  KNN and Xgboost show very similar performance
+
+6.  Dimensionality reduction via PCA did not help to improve results but did not make them worse either
